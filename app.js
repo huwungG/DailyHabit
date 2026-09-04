@@ -47,15 +47,25 @@
       streak: Math.max(0, Math.floor(Number(h.streak) || 0)),
       lastCompleted: h.lastCompleted || null,
       lastDecayAppliedDate: h.lastDecayAppliedDate || null,
+      // history entries: each check-in is a { timestamp, hourOfDay, dateKey } record.
+      // Multi-check-ins per day are now allowed.
       history: Array.isArray(h.history)
         ? h.history
-            .map((entry) => ({
-              timestamp: Number(entry.timestamp) || Date.now(),
-              hourOfDay:
-                typeof entry.hourOfDay === 'number'
-                  ? entry.hourOfDay
-                  : new Date(Number(entry.timestamp) || Date.now()).getHours(),
-            }))
+            .map((entry) => {
+              const ts = Number(entry.timestamp) || Date.now();
+              const d = new Date(ts);
+              return {
+                timestamp: ts,
+                hourOfDay:
+                  typeof entry.hourOfDay === 'number'
+                    ? entry.hourOfDay
+                    : d.getHours(),
+                dateKey:
+                  typeof entry.dateKey === 'string'
+                    ? entry.dateKey
+                    : dayKey(d),
+              };
+            })
             .filter((entry) => entry.hourOfDay >= 0 && entry.hourOfDay <= 23)
         : [],
     };
@@ -118,8 +128,13 @@
   /**
    * Snowball: gain for one completion
    *   gain = base_gain × (1 + streak × 0.1)
-   * Streak also bumps by +1 on a successful check-in.
-   * Capped at 100.
+   *
+   * Multi check-ins per day are now allowed:
+   *   - The first check-in of the day contributes full BASE_GAIN.
+   *   - Each subsequent check-in on the same day adds a *diminishing*
+   *     extra bonus:  base_gain * 0.5^(extra_count - 1), capped at 2.
+   *   - Streak still bumps only once per calendar day (first check-in).
+   *   - score is capped at 100.
    */
   const BASE_GAIN = 6;
 
@@ -127,35 +142,54 @@
     return BASE_GAIN * (1 + streak * 0.1);
   }
 
+  function computeSameDayExtraGain(extraCount) {
+    // extraCount starts at 1 for the 2nd check-in of the day.
+    const factor = Math.pow(0.5, extraCount - 1);
+    return Math.max(0.5, Math.min(2, BASE_GAIN * 0.5 * factor));
+  }
+
   function applyCheckIn(habit, now = new Date()) {
     const previousStreak = habit.streak || 0;
+    const todayKey = dayKey(now);
 
-    // If already checked in today, ignore.
-    if (sameDay(habit.lastCompleted, now)) {
-      return { changed: false, reason: 'Bạn đã check-in thói quen này hôm nay rồi.' };
-    }
+    // Count how many check-ins the user already logged today.
+    const todaysCount = habit.history.filter(
+      (entry) => entry.dateKey === todayKey
+    ).length;
 
-    // If gap > 1 day from last completion, streak resets to 1.
-    let nextStreak;
-    if (!habit.lastCompleted) {
-      nextStreak = 1;
-    } else {
-      const gap = diffDays(new Date(habit.lastCompleted), now);
-      if (gap <= 1) {
-        nextStreak = previousStreak + 1;
-      } else {
-        // Missed one or more days -> reset streak to 1.
+    let nextStreak = previousStreak;
+    let isFirstOfDay = false;
+
+    if (todaysCount === 0) {
+      // First check-in of the day.
+      isFirstOfDay = true;
+      if (!habit.lastCompleted) {
         nextStreak = 1;
+      } else {
+        const gap = diffDays(new Date(habit.lastCompleted), now);
+        if (gap <= 1) {
+          nextStreak = previousStreak + 1;
+        } else {
+          // Missed one or more days -> reset streak to 1.
+          nextStreak = 1;
+        }
       }
     }
 
-    const gain = computeCheckInGain(previousStreak);
+    let gain;
+    if (isFirstOfDay) {
+      gain = computeCheckInGain(previousStreak);
+    } else {
+      gain = computeSameDayExtraGain(todaysCount); // 2nd, 3rd, ...
+    }
+
     habit.streak = nextStreak;
     habit.score = clampScore(habit.score + gain);
     habit.lastCompleted = now.toISOString();
     habit.history.push({
       timestamp: now.getTime(),
       hourOfDay: now.getHours(),
+      dateKey: todayKey,
     });
 
     return {
@@ -163,7 +197,114 @@
       streak: nextStreak,
       gain,
       score: habit.score,
+      isFirstOfDay,
+      todaysCount: todaysCount + 1,
     };
+  }
+
+  /**
+   * Undo the most recent check-in. Removes the last history entry,
+   * reverses the gain, and reverts streak/lastCompleted if needed.
+   */
+  function undoLastCheckIn(habit) {
+    if (!habit.history || habit.history.length === 0) {
+      return { changed: false, reason: 'Chưa có lượt check-in nào để hoàn tác.' };
+    }
+
+    const lastEntry = habit.history[habit.history.length - 1];
+    const entryDateKey = lastEntry.dateKey;
+    const isLastOfDay = habit.history.filter((e) => e.dateKey === entryDateKey)
+      .length === 1;
+
+    // Reverse gain
+    if (isLastOfDay) {
+      // We need to undo the day's gain: if it was the first-of-day, full gain;
+      // otherwise, the diminishing extra gain for that index.
+      const sameDayEntries = habit.history.filter(
+        (e) => e.dateKey === entryDateKey
+      );
+      // After removal, the previous "first-of-day" is the highest remaining one.
+      const prevFirstIndex = habit.history.length - 2;
+      let streakBeforeThisDay = habit.streak;
+      // Recompute what the streak was right before this day.
+      if (prevFirstIndex >= 0) {
+        // Walk back through entries to find the previous day's last timestamp.
+        let i = prevFirstIndex;
+        while (i >= 0 && habit.history[i].dateKey === entryDateKey) i -= 1;
+        if (i >= 0) {
+          // We need the streak value at the time the previous day was completed.
+          // For simplicity, recompute from scratch by simulating the day-order.
+          streakBeforeThisDay = computeStreakFromHistory(habit.history, i);
+        } else {
+          streakBeforeThisDay = 0;
+        }
+      } else {
+        streakBeforeThisDay = 0;
+      }
+
+      const gain =
+        sameDayEntries.length === 1
+          ? computeCheckInGain(streakBeforeThisDay)
+          : computeSameDayExtraGain(sameDayEntries.length - 1);
+
+      habit.score = clampScore(habit.score - gain);
+      habit.streak = streakBeforeThisDay;
+    } else {
+      // There are still other entries today. Use diminishing series.
+      const remainingSameDay = habit.history.filter(
+        (e) => e.dateKey === entryDateKey
+      ).length;
+      const extraIndex = remainingSameDay; // 1st, 2nd, ... of remaining today
+      const gain = computeSameDayExtraGain(extraIndex);
+      habit.score = clampScore(habit.score - gain);
+    }
+
+    habit.history.pop();
+
+    // Update lastCompleted to most recent remaining entry
+    if (habit.history.length > 0) {
+      const last = habit.history[habit.history.length - 1];
+      habit.lastCompleted = new Date(last.timestamp).toISOString();
+    } else {
+      habit.lastCompleted = null;
+      habit.streak = 0;
+    }
+
+    return {
+      changed: true,
+      removed: lastEntry,
+    };
+  }
+
+  /**
+   * Recompute streak by walking backwards from index `endIdx` (inclusive)
+   * through habit.history, counting consecutive days back to today.
+   */
+  function computeStreakFromHistory(historyArr, endIdx) {
+    if (endIdx < 0 || endIdx >= historyArr.length) return 0;
+    // Collect unique dateKeys in [0..endIdx], most recent first.
+    const seen = new Set();
+    const uniqueDays = [];
+    for (let i = endIdx; i >= 0; i -= 1) {
+      const k = historyArr[i].dateKey;
+      if (!seen.has(k)) {
+        seen.add(k);
+        uniqueDays.push(k);
+      }
+    }
+    // Count consecutive days ending at uniqueDays[0].
+    if (uniqueDays.length === 0) return 0;
+    let streak = 1;
+    for (let i = 1; i < uniqueDays.length; i += 1) {
+      const prev = new Date(uniqueDays[i - 1]);
+      const cur = new Date(uniqueDays[i]);
+      if (diffDays(cur, prev) === 1) {
+        streak += 1;
+      } else {
+        break;
+      }
+    }
+    return streak;
   }
 
   /**
@@ -372,9 +513,24 @@
       showToast(result.reason);
       return;
     }
+    const suffix = result.isFirstOfDay
+      ? ''
+      : ` • lần ${result.todaysCount} trong ngày`;
     showToast(
-      `+${result.gain.toFixed(1)} điểm • Streak: ${result.streak} ngày • Tổng: ${result.score.toFixed(1)}%`
+      `+${result.gain.toFixed(1)} điểm • Streak: ${result.streak} ngày • Tổng: ${result.score.toFixed(1)}%${suffix}`
     );
+  }
+
+  function undoHabit(id) {
+    const habit = state.habits.find((h) => h.id === id);
+    if (!habit) return;
+    const result = undoLastCheckIn(habit);
+    saveState();
+    if (!result.changed) {
+      showToast(result.reason, true);
+      return;
+    }
+    showToast('Đã hoàn tác lượt check-in gần nhất.');
   }
 
   /* ---------------- UI ---------------- */
@@ -388,6 +544,8 @@
   const elStatAutopilot = document.getElementById('statAutopilot');
   const elStatBestStreak = document.getElementById('statBestStreak');
   const elStatAvgScore = document.getElementById('statAvgScore');
+  const elStatTodayCount = document.getElementById('statTodayCount');
+  const elStatTotalChecks = document.getElementById('statTotalChecks');
   const elToast = document.getElementById('toast');
 
   /* Modal elements */
@@ -469,6 +627,125 @@
       ? 0
       : habits.reduce((acc, h) => acc + h.score, 0) / habits.length;
     elStatAvgScore.textContent = `${avg.toFixed(0)}%`;
+
+    // New: today's check-ins + total check-ins across all habits.
+    const todayKey = dayKey(new Date());
+    let todayCount = 0;
+    let totalChecks = 0;
+    habits.forEach((h) => {
+      h.history.forEach((entry) => {
+        totalChecks += 1;
+        if (entry.dateKey === todayKey) todayCount += 1;
+      });
+    });
+    elStatTodayCount.textContent = todayCount;
+    elStatTotalChecks.textContent = totalChecks;
+  }
+
+  /* ---------------- FREQUENCY STATS & ACTIVITY GRAPH ---------------- */
+
+  function frequencyStatsForHabit(habit, now = new Date()) {
+    const todayKey = dayKey(now);
+    const nowMs = now.getTime();
+    const day = 86400000;
+    const count = { today: 0, last7: 0, last30: 0, total: 0, bestDay: 0 };
+
+    const perDay = new Map();
+    habit.history.forEach((entry) => {
+      count.total += 1;
+      if (entry.dateKey === todayKey) count.today += 1;
+      if (nowMs - entry.timestamp <= 7 * day) count.last7 += 1;
+      if (nowMs - entry.timestamp <= 30 * day) count.last30 += 1;
+      perDay.set(entry.dateKey, (perDay.get(entry.dateKey) || 0) + 1);
+    });
+    perDay.forEach((v) => {
+      if (v > count.bestDay) count.bestDay = v;
+    });
+    return count;
+  }
+
+  /**
+   * Build a 26-week (≈182 days) activity grid: rows = day-of-week (Sun..Sat),
+   * columns = weeks (oldest left, newest right). Returns:
+   *   { weeks: [[ {dateKey, count, date} ], ...], monthLabels: [{weekIdx, label}] }
+   */
+  function buildActivityGrid(habit, now = new Date()) {
+    const totalDays = 26 * 7; // ~6 months
+    const start = startOfDay(now);
+    start.setDate(start.getDate() - (totalDays - 1));
+
+    // Align grid so each column is a week starting on Sunday.
+    // Compute the Sunday on/before `start`.
+    const firstSunday = new Date(start);
+    firstSunday.setDate(firstSunday.getDate() - firstSunday.getDay());
+
+    // Build day-count map.
+    const perDay = new Map();
+    habit.history.forEach((entry) => {
+      if (entry.dateKey) perDay.set(entry.dateKey, (perDay.get(entry.dateKey) || 0) + 1);
+    });
+
+    // Determine level thresholds based on max count.
+    let maxCount = 0;
+    perDay.forEach((v) => {
+      if (v > maxCount) maxCount = v;
+    });
+
+    const weeks = [];
+    let cursor = new Date(firstSunday);
+    const todayKey = dayKey(now);
+    const lastDate = startOfDay(now);
+
+    let safety = 0;
+    while (cursor <= lastDate && safety < 60) {
+      const week = [];
+      for (let d = 0; d < 7; d += 1) {
+        const cellDate = new Date(cursor);
+        const k = dayKey(cellDate);
+        const count = perDay.get(k) || 0;
+        const isFuture = cellDate > lastDate;
+        const isToday = k === todayKey;
+        let level = 0;
+        if (!isFuture && count > 0 && maxCount > 0) {
+          const ratio = count / maxCount;
+          if (ratio <= 0.25) level = 1;
+          else if (ratio <= 0.5) level = 2;
+          else if (ratio <= 0.75) level = 3;
+          else level = 4;
+        }
+        week.push({
+          dateKey: k,
+          count,
+          date: cellDate,
+          isFuture,
+          isToday,
+          level,
+        });
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      weeks.push(week);
+      safety += 1;
+    }
+
+    // Month labels: put label on the first week whose day1's month differs from previous week.
+    const monthLabels = [];
+    let prevMonth = -1;
+    weeks.forEach((week, idx) => {
+      const first = week[0];
+      if (!first || first.isFuture) {
+        monthLabels.push({ idx, label: '' });
+        return;
+      }
+      const m = first.date.getMonth();
+      if (m !== prevMonth) {
+        monthLabels.push({ idx, label: `T${first.date.getMonth() + 1}` });
+        prevMonth = m;
+      } else {
+        monthLabels.push({ idx, label: '' });
+      }
+    });
+
+    return { weeks, monthLabels, maxCount };
   }
 
   function renderGrid() {
@@ -513,6 +790,9 @@
     if (action === 'checkin') {
       checkInHabit(id);
       render();
+    } else if (action === 'undo') {
+      undoHabit(id);
+      render();
     } else if (action === 'edit') {
       openEditModal(id);
     } else if (action === 'delete') {
@@ -531,7 +811,8 @@
     const stage = getStage(score);
     const stageName = getStageName(stage);
     const stageClass = `badge-stage-${stage}`;
-    const doneToday = sameDay(habit.lastCompleted, now);
+    const todayKey = dayKey(now);
+    const todaysCount = habit.history.filter((e) => e.dateKey === todayKey).length;
     const lastText = habit.lastCompleted
       ? `Lần cuối: ${formatDateTime(new Date(habit.lastCompleted))}`
       : 'Chưa từng hoàn thành';
@@ -550,6 +831,57 @@
         return `<div class="hour-bar ${isEmpty ? 'is-empty' : ''} ${isCurrent ? 'is-current' : ''}" style="height:${heightPct}%" title="${h}h — ${p.toFixed(0)}%"></div>`;
       })
       .join('');
+
+    const freq = frequencyStatsForHabit(habit, now);
+    const grid = buildActivityGrid(habit, now);
+
+    const cells = grid.weeks
+      .map((week) =>
+        week
+          .map(
+            (cell) => {
+              const lvl = cell.isFuture ? 0 : cell.level;
+              const lvlAttr = cell.isToday ? 'today' : String(lvl);
+              const title = cell.isFuture
+                ? ''
+                : `${formatDateShort(cell.date)} — ${cell.count} lượt`;
+              return `<div class="activity-cell" data-level="${lvlAttr}" title="${title}"></div>`;
+            }
+          )
+          .join('')
+      )
+      .join('');
+
+    const monthRow = grid.monthLabels
+      .map((m) => `<span>${escapeHTML(m.label)}</span>`)
+      .join('');
+
+    const historyItems = habit.history
+      .slice(-30)
+      .reverse()
+      .map((entry) => {
+        const d = new Date(entry.timestamp);
+        const dateLabel = `${d.getDate()}/${d.getMonth() + 1}`;
+        const timeLabel = `${String(d.getHours()).padStart(2, '0')}:${String(
+          d.getMinutes()
+        ).padStart(2, '0')}`;
+        return `
+          <div class="history-item">
+            <span><span class="ts">${timeLabel}</span> <span class="meta">${dateLabel}</span></span>
+            <span class="meta">${entry.dateKey === todayKey ? 'hôm nay' : ''}</span>
+          </div>
+        `;
+      })
+      .join('');
+
+    const historyBlock = habit.history.length
+      ? `<div class="history-list">${historyItems}</div>`
+      : `<div class="history-list"><div class="history-empty">Chưa có lượt check-in nào.</div></div>`;
+
+    const checkinLabel =
+      todaysCount === 0
+        ? `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Hoàn thành hôm nay`
+        : `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Check-in thêm (${todaysCount} hôm nay)`;
 
     return `
       <article class="habit-card" data-id="${habit.id}">
@@ -593,16 +925,48 @@
           <div class="hour-chart">${hourBars}</div>
         </div>
 
+        <div class="history-block">
+          <div class="history-head">
+            <span>Tần suất hoạt động</span>
+            <span class="history-stats">
+              <span><strong>${freq.today}</strong>hôm nay</span>
+              <span><strong>${freq.last7}</strong>/7n</span>
+              <span><strong>${freq.last30}</strong>/30n</span>
+              <span><strong>${freq.total}</strong>tổng</span>
+            </span>
+          </div>
+          <div class="activity-months">${monthRow}</div>
+          <div class="activity-graph">${cells}</div>
+          <div class="activity-legend">
+            <span>Ít</span>
+            <div class="activity-cell" data-level="0"></div>
+            <div class="activity-cell" data-level="1"></div>
+            <div class="activity-cell" data-level="2"></div>
+            <div class="activity-cell" data-level="3"></div>
+            <div class="activity-cell" data-level="4"></div>
+            <span>Nhiều</span>
+          </div>
+        </div>
+
+        ${historyBlock}
+
         <div class="checkin-row">
           <button
-            class="checkin-btn ${doneToday ? 'done-today' : ''}"
+            class="checkin-btn ${todaysCount > 0 ? 'done-today' : ''}"
             data-action="checkin"
             data-id="${habit.id}"
-            ${doneToday ? 'disabled' : ''}
           >
-            ${doneToday
-              ? '✓ Đã check-in hôm nay'
-              : '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Hoàn thành hôm nay'}
+            ${checkinLabel}
+          </button>
+          <button
+            class="mini-btn"
+            data-action="undo"
+            data-id="${habit.id}"
+            title="Hoàn tác lượt gần nhất"
+            aria-label="Hoàn tác"
+            ${habit.history.length === 0 ? 'disabled' : ''}
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/></svg>
           </button>
         </div>
       </article>
@@ -620,6 +984,10 @@
     const d = date;
     const day = `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`;
     return `${day} ${formatTime(d)}`;
+  }
+
+  function formatDateShort(date) {
+    return `${date.getDate()}/${date.getMonth() + 1}/${date.getFullYear()}`;
   }
 
   function escapeHTML(s) {
