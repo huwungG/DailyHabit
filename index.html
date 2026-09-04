@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Habit Snowball &amp; Time-Tracker</title>
-  <link rel="stylesheet" href="styles.css?v=5" />
+  <link rel="stylesheet" href="styles.css?v=7" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
@@ -83,6 +83,9 @@
     <div class="section-head">
       <h2>Thói quen của bạn</h2>
       <div class="legend">
+        <span class="legend-item"><i class="dot dot-type-good"></i>Thói quen tốt</span>
+        <span class="legend-item"><i class="dot dot-type-bad"></i>Thói quen xấu</span>
+        <span class="legend-sep"></span>
         <span class="legend-item"><i class="dot dot-stage-1"></i>Khởi động</span>
         <span class="legend-item"><i class="dot dot-stage-2"></i>Tích tụ</span>
         <span class="legend-item"><i class="dot dot-stage-3"></i>Vô thức</span>
@@ -94,7 +97,7 @@
     <div class="empty-state" id="emptyState" hidden>
       <div class="empty-illustration" aria-hidden="true">❄️</div>
       <h3>Chưa có quả cầu tuyết nào</h3>
-      <p>Bắt đầu bằng cách thêm một thói quen bạn muốn biến thành phản xạ.</p>
+      <p>Bắt đầu bằng cách thêm một thói quen tốt bạn muốn xây dựng, hoặc một thói quen xấu bạn muốn theo dõi để cai dần.</p>
       <button class="btn btn-primary" id="emptyAddBtn">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
         Tạo thói quen đầu tiên
@@ -139,6 +142,28 @@
           <input id="habitScore" type="number" min="0" max="100" step="1" value="0" />
         </label>
 
+        <div class="field">
+          <span>Loại thói quen</span>
+          <div class="type-toggle" role="radiogroup" aria-label="Loại thói quen">
+            <label class="type-option type-option-good">
+              <input type="radio" name="habitType" value="good" checked />
+              <span class="type-emoji">✨</span>
+              <span class="type-label">
+                <strong>Thói quen tốt</strong>
+                <small>Check-in sẽ tăng điểm vô thức</small>
+              </span>
+            </label>
+            <label class="type-option type-option-bad">
+              <input type="radio" name="habitType" value="bad" />
+              <span class="type-emoji">🚫</span>
+              <span class="type-label">
+                <strong>Thói quen xấu</strong>
+                <small>Check-in sẽ trừ điểm vô thức</small>
+              </span>
+            </label>
+          </div>
+        </div>
+
         <div class="modal-actions">
           <button type="button" class="btn btn-ghost" id="cancelModalBtn" data-close="1">Huỷ</button>
           <button type="submit" class="btn btn-primary">Lưu thói quen</button>
@@ -154,6 +179,6 @@
   <!-- ============== TOAST ============== -->
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>

@@ -43,6 +43,9 @@
       id: h.id || makeId(),
       name: h.name || 'Thói quen không tên',
       emoji: h.emoji || '',
+      // 'good' = check-ins raise the automaticity score.
+      // 'bad'  = check-ins lower it (the user wants to track / avoid them).
+      type: h.type === 'bad' ? 'bad' : 'good',
       score: clampScore(Number(h.score) || 0),
       streak: Math.max(0, Math.floor(Number(h.streak) || 0)),
       lastCompleted: h.lastCompleted || null,
@@ -183,6 +186,11 @@
       gain = computeSameDayExtraGain(todaysCount); // 2nd, 3rd, ...
     }
 
+    // Bad habits: each check-in *reduces* the automaticity score.
+    if (habit.type === 'bad') {
+      gain = -Math.abs(gain);
+    }
+
     habit.streak = nextStreak;
     habit.score = clampScore(habit.score + gain);
     habit.lastCompleted = now.toISOString();
@@ -247,7 +255,8 @@
           ? computeCheckInGain(streakBeforeThisDay)
           : computeSameDayExtraGain(sameDayEntries.length - 1);
 
-      habit.score = clampScore(habit.score - gain);
+      const signed = habit.type === 'bad' ? -Math.abs(gain) : gain;
+      habit.score = clampScore(habit.score - signed);
       habit.streak = streakBeforeThisDay;
     } else {
       // There are still other entries today. Use diminishing series.
@@ -256,7 +265,8 @@
       ).length;
       const extraIndex = remainingSameDay; // 1st, 2nd, ... of remaining today
       const gain = computeSameDayExtraGain(extraIndex);
-      habit.score = clampScore(habit.score - gain);
+      const signed = habit.type === 'bad' ? -Math.abs(gain) : gain;
+      habit.score = clampScore(habit.score - signed);
     }
 
     habit.history.pop();
@@ -456,7 +466,7 @@
           for (let i = 0; i < count; i += 1) {
             const h = hours[Math.floor(Math.random() * hours.length)];
             const ts = dayBase + h * 3600000 + Math.floor(Math.random() * 1800000);
-            out.push({ timestamp: ts, hourOfDay: h });
+            out.push({ timestamp: ts, hourOfDay: h, dateKey: dayKey(new Date(ts)) });
           }
         }
       }
@@ -468,18 +478,21 @@
       mk('Đọc sách 20 phút', '📚', 68, 12, synthHistory([21, 22, 23])),
       mk('Thiền 10 phút', '🧘', 18, 2, synthHistory([6, 7, 22])),
       mk('Uống đủ 2L nước', '💧', 80, 22, synthHistory([8, 9, 13, 15, 17, 20])),
+      { ...mk('Hút thuốc', '🚬', 30, 0, synthHistory([10, 15, 20])), type: 'bad' },
+      { ...mk('Lướt điện thoại trước khi ngủ', '📱', 55, 0, synthHistory([22, 23, 0])), type: 'bad' },
     ];
     saveState();
   }
   seedIfEmpty();
 
-  function addOrUpdateHabit({ id, name, emoji, score }) {
+  function addOrUpdateHabit({ id, name, emoji, score, type }) {
     if (id) {
       const h = state.habits.find((x) => x.id === id);
       if (h) {
         h.name = name.trim() || 'Thói quen không tên';
         h.emoji = (emoji || '').trim().slice(0, 4);
         h.score = clampScore(Number(score) || 0);
+        h.type = type === 'bad' ? 'bad' : 'good';
         saveState();
         return h;
       }
@@ -488,6 +501,7 @@
       id: makeId(),
       name: (name || '').trim() || 'Thói quen mới',
       emoji: (emoji || '').trim().slice(0, 4),
+      type: type === 'bad' ? 'bad' : 'good',
       score: clampScore(Number(score) || 0),
       streak: 0,
       lastCompleted: null,
@@ -516,8 +530,9 @@
     const suffix = result.isFirstOfDay
       ? ''
       : ` • lần ${result.todaysCount} trong ngày`;
+    const sign = result.gain >= 0 ? '+' : '';
     showToast(
-      `+${result.gain.toFixed(1)} điểm • Streak: ${result.streak} ngày • Tổng: ${result.score.toFixed(1)}%${suffix}`
+      `${sign}${result.gain.toFixed(1)} điểm • Streak: ${result.streak} ngày • Tổng: ${result.score.toFixed(1)}%${suffix}`
     );
   }
 
@@ -878,13 +893,18 @@
       ? `<div class="history-list">${historyItems}</div>`
       : `<div class="history-list"><div class="history-empty">Chưa có lượt check-in nào.</div></div>`;
 
+    const isBad = habit.type === 'bad';
+    const cardClass = `habit-card${isBad ? ' is-bad' : ''}`;
+    const typeBadge = isBad
+      ? `<span class="badge badge-type-bad">🚫 Thói quen xấu</span>`
+      : `<span class="badge badge-type-good">✨ Thói quen tốt</span>`;
     const checkinLabel =
       todaysCount === 0
-        ? `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Hoàn thành hôm nay`
-        : `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Check-in thêm (${todaysCount} hôm nay)`;
+        ? `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> ${isBad ? 'Đã mắc hôm nay' : 'Hoàn thành hôm nay'}`
+        : `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> ${isBad ? `Ghi nhận thêm (${todaysCount} hôm nay)` : `Check-in thêm (${todaysCount} hôm nay)`}`;
 
     return `
-      <article class="habit-card" data-id="${habit.id}">
+      <article class="${cardClass}" data-id="${habit.id}">
         <div class="habit-card-head">
           <div class="habit-emoji">${escapeHTML(emoji)}</div>
           <div class="habit-title-wrap">
@@ -902,6 +922,7 @@
         </div>
 
         <div class="badges">
+          ${typeBadge}
           <span class="badge ${stageClass}">● ${stageName}</span>
           <span class="badge badge-streak">🔥 Streak: ${habit.streak || 0} ngày</span>
           <span class="badge badge-prob">⏱ Xác suất: ${prob}%</span>
@@ -1012,12 +1033,31 @@
   }
 
   /* ---------------- MODAL ---------------- */
+  function getSelectedHabitType() {
+    const r = document.querySelector('input[name="habitType"]:checked');
+    return r && r.value === 'bad' ? 'bad' : 'good';
+  }
+
+  function setSelectedHabitType(type) {
+    const target = type === 'bad' ? 'bad' : 'good';
+    document.querySelectorAll('input[name="habitType"]').forEach((r) => {
+      r.checked = r.value === target;
+    });
+    document.querySelectorAll('.type-option').forEach((el) => {
+      el.classList.toggle(
+        'is-selected',
+        el.querySelector('input[name="habitType"]').value === target
+      );
+    });
+  }
+
   function openAddModal() {
     modalTitle.textContent = 'Thêm thói quen mới';
     habitIdInput.value = '';
     habitNameInput.value = '';
     habitEmojiInput.value = '';
     habitScoreInput.value = '0';
+    setSelectedHabitType('good');
     modalBackdrop.hidden = false;
     modalBackdrop.style.display = '';
     setTimeout(() => habitNameInput.focus(), 50);
@@ -1031,6 +1071,7 @@
     habitNameInput.value = h.name;
     habitEmojiInput.value = h.emoji || '';
     habitScoreInput.value = String(Math.round(h.score));
+    setSelectedHabitType(h.type || 'good');
     modalBackdrop.hidden = false;
     modalBackdrop.style.display = '';
     setTimeout(() => habitNameInput.focus(), 50);
@@ -1053,10 +1094,22 @@
       name,
       emoji: habitEmojiInput.value,
       score: habitScoreInput.value,
+      type: getSelectedHabitType(),
     });
     closeModal();
     render();
     showToast(habitIdInput.value ? 'Đã cập nhật.' : 'Đã thêm thói quen mới.');
+  });
+
+  // Toggle visual selection on the type picker
+  document.querySelectorAll('input[name="habitType"]').forEach((radio) => {
+    radio.addEventListener('change', () => setSelectedHabitType(radio.value));
+  });
+  document.querySelectorAll('.type-option').forEach((opt) => {
+    opt.addEventListener('click', () => {
+      const v = opt.querySelector('input[name="habitType"]').value;
+      setSelectedHabitType(v);
+    });
   });
 
   document.getElementById('openAddBtn').addEventListener('click', openAddModal);
