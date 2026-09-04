@@ -7,6 +7,8 @@
 
   /* ---------------- STORAGE ---------------- */
   const STORAGE_KEY = 'habit_snowball_v1';
+  const SYNC_CONFIG_KEY = 'habit_snowball_sync_v1';
+  const SYNC_META_KEY = 'habit_snowball_sync_meta_v1';
 
   const DEFAULT_STATE = {
     habits: [],
@@ -1152,4 +1154,438 @@
   render();
   tick();
   setInterval(tick, 30000); // update predictive bar every 30s
+  // Auto-sync in background every 60s (best-effort, only when configured + online).
+  setInterval(() => { maybeAutoSync(); }, 60000);
+  window.addEventListener('online', () => { maybeAutoSync(true); });
+
+  /* =========================================================
+   *  SYNC MODULE — Google Apps Script + Google Sheets backend
+   * ========================================================= */
+  //
+  // State stored in localStorage (per-device):
+  //   SYNC_CONFIG_KEY: { url, passcode, deviceId, deviceName }
+  //   SYNC_META_KEY  : { lastSyncedAt, lastPushAt, lastPullAt, lastError }
+  //
+  // Server-side single source of truth lives in Google Sheets
+  // (managed by Code.gs). We always keep a full local snapshot of
+  // `state` and merge it with the server snapshot using a
+  // "most-recent history per habit wins" rule, so simultaneous edits
+  // on two devices won't silently drop data.
+
+  function loadSyncConfig() {
+    try {
+      const raw = localStorage.getItem(SYNC_CONFIG_KEY);
+      if (!raw) return null;
+      const cfg = JSON.parse(raw);
+      if (cfg && typeof cfg === 'object') return cfg;
+    } catch (err) { /* ignore */ }
+    return null;
+  }
+
+  function saveSyncConfig(cfg) {
+    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(cfg));
+  }
+
+  function loadSyncMeta() {
+    try {
+      const raw = localStorage.getItem(SYNC_META_KEY);
+      if (!raw) return { lastSyncedAt: 0, lastPushAt: 0, lastPullAt: 0, lastError: '' };
+      return Object.assign({ lastSyncedAt: 0, lastPushAt: 0, lastPullAt: 0, lastError: '' }, JSON.parse(raw));
+    } catch (err) {
+      return { lastSyncedAt: 0, lastPushAt: 0, lastPullAt: 0, lastError: '' };
+    }
+  }
+
+  function saveSyncMeta(meta) {
+    localStorage.setItem(SYNC_META_KEY, JSON.stringify(meta));
+  }
+
+  function ensureDeviceId(cfg) {
+    let id = cfg.deviceId;
+    if (!id || typeof id !== 'string') {
+      id = 'dev_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+      cfg.deviceId = id;
+    }
+    if (!cfg.deviceName) {
+      try {
+        const ua = navigator.userAgent || '';
+        let name = 'Thiết bị';
+        if (/iPhone/i.test(ua)) name = 'iPhone';
+        else if (/iPad/i.test(ua)) name = 'iPad';
+        else if (/Android/i.test(ua)) name = 'Android';
+        else if (/Windows/i.test(ua)) name = 'Windows';
+        else if (/Mac/i.test(ua)) name = 'Mac';
+        else if (/Linux/i.test(ua)) name = 'Linux';
+        cfg.deviceName = name;
+      } catch (err) {
+        cfg.deviceName = 'Thiết bị';
+      }
+    }
+    return cfg;
+  }
+
+  /**
+   * Merge two habit lists (local + remote) so that:
+   *  - New habits on either side are kept.
+   *  - If the same habit ID exists on both, we keep the side whose
+   *    last history entry is more recent. If both have empty history
+   *    (e.g. newly created), we prefer the higher score; if equal,
+   *    we keep the local copy.
+   *
+   * Returns: merged { habits } state.
+   */
+  function mergeStates(local, remote) {
+    const localHabits  = Array.isArray(local  && local.habits)  ? local.habits  : [];
+    const remoteHabits = Array.isArray(remote && remote.habits) ? remote.habits : [];
+
+    const byId = new Map();
+    // Index local first.
+    localHabits.forEach((h) => byId.set(h.id, { local: h, remote: null }));
+    // Merge remote in.
+    remoteHabits.forEach((h) => {
+      const entry = byId.get(h.id);
+      if (!entry) {
+        byId.set(h.id, { local: null, remote: h });
+      } else {
+        entry.remote = h;
+      }
+    });
+
+    const merged = [];
+    byId.forEach(({ local: lh, remote: rh }) => {
+      const winner = pickWinner_(lh, rh);
+      merged.push(winner);
+    });
+
+    // Sort newest-first like the rest of the app expects.
+    merged.sort((a, b) => {
+      const ta = a.lastCompleted ? new Date(a.lastCompleted).getTime() : 0;
+      const tb = b.lastCompleted ? new Date(b.lastCompleted).getTime() : 0;
+      return tb - ta;
+    });
+
+    return { habits: merged };
+  }
+
+  function pickWinner_(local, remote) {
+    if (local && !remote) return local;
+    if (remote && !local) return remote;
+
+    const lHist = Array.isArray(local.history)  ? local.history  : [];
+    const rHist = Array.isArray(remote.history) ? remote.history : [];
+
+    const lLatest = lHist.length ? lHist[lHist.length - 1].timestamp : 0;
+    const rLatest = rHist.length ? rHist[rHist.length - 1].timestamp : 0;
+
+    if (lLatest !== rLatest) {
+      return lLatest > rLatest ? local : remote;
+    }
+
+    // Tiebreaker: prefer higher score, then local.
+    if ((local.score || 0) !== (remote.score || 0)) {
+      return (local.score || 0) > (remote.score || 0) ? local : remote;
+    }
+    return local;
+  }
+
+  /** Read from cloud. Returns { ok, state, updatedAt } or { ok:false, error }. */
+  async function fetchFromCloud(cfg) {
+    const url = cfg.url + (cfg.url.includes('?') ? '&' : '?') + 'p=' + encodeURIComponent(cfg.passcode || '');
+    const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+    if (!res.ok) {
+      return { ok: false, error: 'HTTP ' + res.status };
+    }
+    const data = await res.json();
+    return data;
+  }
+
+  /** Write to cloud. Returns { ok, updatedAt } or { ok:false, error, conflict, serverState }. */
+  async function pushToCloud(cfg, stateObj, baseUpdatedAt) {
+    const url = cfg.url + (cfg.url.includes('?') ? '&' : '?') + 'p=' + encodeURIComponent(cfg.passcode || '');
+    const body = JSON.stringify({
+      state: stateObj,
+      updatedAt: Date.now(),
+      baseUpdatedAt: baseUpdatedAt || 0,
+    });
+    const res = await fetch(url, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body,
+    });
+    if (!res.ok) {
+      return { ok: false, error: 'HTTP ' + res.status };
+    }
+    const data = await res.json();
+    return data;
+  }
+
+  /** Pull → merge → push back. Safe default for the user. */
+  async function performPullMergePush(cfg) {
+    const meta = loadSyncMeta();
+    const localSnapshot = JSON.parse(JSON.stringify(state));
+    let serverUpdatedAt = 0;
+
+    const fetch = await fetchFromCloud(cfg);
+    if (!fetch.ok) {
+      meta.lastError = fetch.error || 'Tải về thất bại';
+      saveSyncMeta(meta);
+      return { ok: false, error: meta.lastError };
+    }
+
+    const serverState = fetch.state || { habits: [] };
+    serverUpdatedAt   = Number(fetch.updatedAt) || 0;
+
+    const merged = mergeStates(localSnapshot, serverState);
+
+    // Push merged result back so both sides converge.
+    const push = await pushToCloud(cfg, merged, serverUpdatedAt);
+    if (!push.ok) {
+      meta.lastError = push.error || 'Đẩy lên thất bại';
+      saveSyncMeta(meta);
+      return { ok: false, error: meta.lastError, conflict: !!push.conflict };
+    }
+
+    // Apply merge locally.
+    state = merged;
+    saveState();
+    saveSyncMeta({
+      lastSyncedAt: Date.now(),
+      lastPushAt: Date.now(),
+      lastPullAt: Date.now(),
+      lastError: '',
+    });
+    render();
+    return { ok: true, merged: true };
+  }
+
+  /** Just push local state up (overwrites cloud). */
+  async function performPushOnly(cfg) {
+    const meta = loadSyncMeta();
+    const localSnapshot = JSON.parse(JSON.stringify(state));
+    const fetch = await fetchFromCloud(cfg);
+    const serverUpdatedAt = fetch.ok ? (Number(fetch.updatedAt) || 0) : 0;
+
+    const push = await pushToCloud(cfg, localSnapshot, serverUpdatedAt);
+    if (!push.ok) {
+      meta.lastError = push.error || 'Đẩy lên thất bại';
+      saveSyncMeta(meta);
+      return { ok: false, error: meta.lastError, conflict: !!push.conflict, serverState: push.serverState };
+    }
+    saveSyncMeta({
+      lastSyncedAt: Date.now(),
+      lastPushAt: Date.now(),
+      lastPullAt: meta.lastPullAt,
+      lastError: '',
+    });
+    showToast('Đã đẩy lên cloud.');
+    return { ok: true };
+  }
+
+  /** Just pull from cloud and overwrite local. */
+  async function performPullOnly(cfg) {
+    const meta = loadSyncMeta();
+    const fetch = await fetchFromCloud(cfg);
+    if (!fetch.ok) {
+      meta.lastError = fetch.error || 'Tải về thất bại';
+      saveSyncMeta(meta);
+      return { ok: false, error: meta.lastError };
+    }
+    const serverState = fetch.state || { habits: [] };
+    state = serverState;
+    state.habits = (state.habits || []).map(normalizeHabit);
+    saveState();
+    saveSyncMeta({
+      lastSyncedAt: Date.now(),
+      lastPushAt: meta.lastPushAt,
+      lastPullAt: Date.now(),
+      lastError: '',
+    });
+    render();
+    showToast('Đã tải về từ cloud.');
+    return { ok: true };
+  }
+
+  function maybeAutoSync(force) {
+    const cfg = loadSyncConfig();
+    if (!cfg || !cfg.url) return;
+    if (!navigator.onLine) return;
+    // Don't auto-sync right after a user edit (avoid stomping); instead,
+    // debounce: any state-mutating call schedules a sync in 4s.
+    if (syncScheduled_) return;
+    syncScheduled_ = true;
+    setTimeout(async () => {
+      syncScheduled_ = false;
+      try {
+        await performPullMergePush(cfg);
+      } catch (err) {
+        // swallow auto-sync errors quietly
+        const meta = loadSyncMeta();
+        meta.lastError = (err && err.message) ? err.message : String(err);
+        saveSyncMeta(meta);
+      }
+    }, force ? 0 : 4000);
+  }
+  let syncScheduled_ = false;
+
+  /* ---------------- SYNC UI WIRING ---------------- */
+  const syncBackdrop     = document.getElementById('syncBackdrop');
+  const syncUrlInput     = document.getElementById('syncUrl');
+  const syncPassInput    = document.getElementById('syncPass');
+  const syncStatusEl     = document.getElementById('syncStatus');
+  const syncLastInfoEl   = document.getElementById('syncLastInfo');
+  const syncBtn          = document.getElementById('openSyncBtn');
+
+  function openSyncModal() {
+    const cfg = ensureDeviceId(loadSyncConfig() || {});
+    syncUrlInput.value  = cfg.url || '';
+    syncPassInput.value = cfg.passcode || '';
+    updateSyncLastInfo();
+    syncBackdrop.hidden = false;
+    syncBackdrop.style.display = '';
+    setTimeout(() => syncUrlInput.focus(), 50);
+  }
+  function closeSyncModal() {
+    syncBackdrop.hidden = true;
+    syncBackdrop.style.display = '';
+  }
+  function updateSyncLastInfo() {
+    const meta = loadSyncMeta();
+    if (!meta.lastSyncedAt) {
+      syncLastInfoEl.textContent = 'Chưa từng đồng bộ.';
+      return;
+    }
+    const fmt = (ts) => {
+      if (!ts) return '—';
+      const d = new Date(ts);
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} ${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth()+1).padStart(2, '0')}`;
+    };
+    syncLastInfoEl.textContent =
+      `Lần cuối: ${fmt(meta.lastSyncedAt)} • Push: ${fmt(meta.lastPushAt)} • Pull: ${fmt(meta.lastPullAt)}` +
+      (meta.lastError ? ` • Lỗi gần nhất: ${meta.lastError}` : '');
+  }
+  function setSyncBusy(busy) {
+    if (!syncBtn) return;
+    syncBtn.classList.toggle('is-syncing', !!busy);
+    syncBtn.disabled = !!busy;
+  }
+
+  function handleSyncError(prefix, err) {
+    const msg = (err && err.error) ? err.error : (err && err.message) ? err.message : String(err || 'Lỗi không xác định');
+    showToast(prefix + ': ' + msg, true);
+    const meta = loadSyncMeta();
+    meta.lastError = msg;
+    saveSyncMeta(meta);
+    updateSyncLastInfo();
+  }
+
+  if (syncBtn) {
+    syncBtn.addEventListener('click', openSyncModal);
+  }
+
+  document.getElementById('closeSyncBtn').addEventListener('click', closeSyncModal);
+  document.getElementById('syncBigCloseBtn').addEventListener('click', closeSyncModal);
+  syncBackdrop.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button');
+    if (btn && (btn.id === 'closeSyncBtn' || btn.id === 'syncBigCloseBtn' || btn.dataset.closeSync === '1')) {
+      closeSyncModal();
+      return;
+    }
+    if (ev.target === syncBackdrop) closeSyncModal();
+  });
+
+  document.getElementById('syncSaveBtn').addEventListener('click', () => {
+    const url = (syncUrlInput.value || '').trim();
+    const passcode = (syncPassInput.value || '').trim();
+    if (!url || !/^https:\/\/script\.google\.com\//.test(url)) {
+      showToast('URL không hợp lệ. Cần bắt đầu bằng https://script.google.com/', true);
+      return;
+    }
+    let cfg = ensureDeviceId(loadSyncConfig() || {});
+    cfg.url = url;
+    cfg.passcode = passcode;
+    saveSyncConfig(cfg);
+    showToast('Đã lưu cấu hình đồng bộ.');
+    updateSyncLastInfo();
+    maybeAutoSync(true);
+  });
+
+  document.getElementById('syncPushBtn').addEventListener('click', async () => {
+    const cfg = ensureDeviceId(loadSyncConfig() || {});
+    if (!cfg.url) {
+      showToast('Vui lòng nhập URL và bấm Lưu cấu hình trước.', true);
+      return;
+    }
+    saveSyncConfig({ ...cfg, url: syncUrlInput.value.trim(), passcode: syncPassInput.value.trim() });
+    setSyncBusy(true);
+    try {
+      const cfg2 = loadSyncConfig();
+      const res = await performPushOnly(cfg2);
+      if (!res.ok) {
+        handleSyncError('Đẩy lên thất bại', res);
+        if (res.conflict && res.serverState) {
+          const ok = confirm('Server có phiên bản mới hơn. Bạn có muốn gộp (merge) với server không? Bấm Cancel để giữ nguyên bản local và không ghi đè.');
+          if (ok) {
+            const m = await performPullMergePush(cfg2);
+            if (!m.ok) handleSyncError('Merge thất bại', m);
+          }
+        }
+      }
+    } finally {
+      setSyncBusy(false);
+      updateSyncLastInfo();
+    }
+  });
+
+  document.getElementById('syncPullBtn').addEventListener('click', async () => {
+    const cfg = ensureDeviceId(loadSyncConfig() || {});
+    if (!cfg.url) {
+      showToast('Vui lòng nhập URL và bấm Lưu cấu hình trước.', true);
+      return;
+    }
+    saveSyncConfig({ ...cfg, url: syncUrlInput.value.trim(), passcode: syncPassInput.value.trim() });
+    const ok = confirm('Tải về từ cloud sẽ THAY THẾ toàn bộ dữ liệu trên thiết bị này. Nếu muốn an toàn, hãy dùng nút "Lưu cấu hình" rồi đợi app tự đồng bộ. Tiếp tục?');
+    if (!ok) return;
+    setSyncBusy(true);
+    try {
+      const cfg2 = loadSyncConfig();
+      const res = await performPullOnly(cfg2);
+      if (!res.ok) handleSyncError('Tải về thất bại', res);
+    } finally {
+      setSyncBusy(false);
+      updateSyncLastInfo();
+    }
+  });
+
+  // ESC closes sync modal too
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !syncBackdrop.hidden) closeSyncModal();
+  });
+
+  /* ---------------- HOOK SYNC INTO STATE MUTATIONS ---------------- */
+  // Wrap saveState to schedule a background sync after each change.
+  // (We mutate the inner variable instead of redefining saveState
+  // to keep all existing call sites working.)
+  const _origSaveState = saveState;
+  saveState = function patchedSaveState() {
+    _origSaveState();
+    scheduleBackgroundSync_();
+  };
+  function scheduleBackgroundSync_() {
+    const cfg = loadSyncConfig();
+    if (!cfg || !cfg.url) return;
+    if (syncScheduled_) return;
+    syncScheduled_ = true;
+    setTimeout(async () => {
+      syncScheduled_ = false;
+      if (!navigator.onLine) return;
+      try {
+        await performPullMergePush(cfg);
+      } catch (err) {
+        const meta = loadSyncMeta();
+        meta.lastError = (err && err.message) ? err.message : String(err);
+        saveSyncMeta(meta);
+      }
+    }, 5000);
+  }
 })();

@@ -803,6 +803,38 @@ input {
 .modal-big-close:hover { background: var(--surface-hover); border-color: var(--border-strong); }
 .modal-big-close:active { background: var(--bg-soft); transform: scale(0.98); }
 
+/* Sync button + modal */
+.topbar-actions #openSyncBtn { padding: 9px 12px; gap: 6px; }
+.topbar-actions #openSyncBtn .sync-label { font-size: 13px; }
+.topbar-actions #openSyncBtn.is-syncing svg { animation: sync-spin 1s linear infinite; }
+@keyframes sync-spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+
+.sync-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  line-height: 1.5;
+}
+.sync-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 6px;
+}
+.sync-actions .btn-ghost { padding: 10px 8px; font-size: 13px; }
+.sync-actions #syncSaveBtn {
+  grid-column: 1 / -1;
+}
+.sync-last {
+  font-size: 12px;
+  color: var(--text-soft);
+  text-align: center;
+  padding: 6px 4px 0;
+}
+
 .guide-body .guide-block {
   padding: 12px 14px;
   border-radius: var(--radius);
