@@ -1,0 +1,5 @@
+{"sessionId":"f3ebb5","location":"app.js:BOOT","message":"post-fix boot ok","data":{"habitsCount":4,"modalBtn":true},"timestamp":1788520692508,"runId":"post-fix","hypothesisId":"A"}
+{"sessionId":"f3ebb5","location":"app.js:closeModal-bind","message":"close handler bound","data":{},"timestamp":1788520908477,"runId":"fix2","hypothesisId":"B"}
+{"sessionId":"f3ebb5","location":"app.js:closeModal-bind","message":"close handler bound","data":{},"timestamp":1788520993754,"runId":"fix2","hypothesisId":"B"}
+{"sessionId":"f3ebb5","location":"app.js:closeModal-bind","message":"close handler bound","data":{},"timestamp":1788521102808,"runId":"fix2","hypothesisId":"B"}
+{"sessionId":"f3ebb5","location":"app.js:closeModal-bind","message":"close handler bound","data":{},"timestamp":1788521122931,"runId":"fix2","hypothesisId":"B"}

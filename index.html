@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Habit Snowball &amp; Time-Tracker</title>
+  <link rel="stylesheet" href="styles.css?v=4" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap"
+    rel="stylesheet"
+  />
+</head>
+<body>
+  <!-- ============== HEADER ============== -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"></circle>
+          <circle cx="12" cy="12" r="5"></circle>
+          <circle cx="12" cy="12" r="1.5" fill="currentColor"></circle>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>Habit Snowball</h1>
+        <p>Xây dựng thói quen theo cơ chế phản xạ vô thức</p>
+      </div>
+    </div>
+
+    <div class="topbar-actions">
+      <div class="clock" id="liveClock" aria-live="polite">--:--</div>
+      <button class="btn btn-primary" id="openAddBtn">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        Thêm thói quen
+      </button>
+    </div>
+  </header>
+
+  <!-- ============== PREDICTIVE BAR ============== -->
+  <section class="predictive-bar" id="predictiveBar">
+    <div class="predictive-time">
+      <span class="predictive-label">Bây giờ là</span>
+      <strong id="predictiveTimeText">--:--</strong>
+      <span class="predictive-slot" id="predictiveSlot">—</span>
+    </div>
+    <div class="predictive-msg" id="predictiveMsg">
+      Thêm vài thói quen và bắt đầu check-in để nhận gợi ý thông minh.
+    </div>
+  </section>
+
+  <!-- ============== SUMMARY STATS ============== -->
+  <section class="stats">
+    <div class="stat-card">
+      <div class="stat-label">Tổng thói quen</div>
+      <div class="stat-value" id="statTotal">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Đang ở giai đoạn Vô thức</div>
+      <div class="stat-value" id="statAutopilot">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Streak dài nhất</div>
+      <div class="stat-value" id="statBestStreak">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Điểm Vô thức trung bình</div>
+      <div class="stat-value" id="statAvgScore">0%</div>
+    </div>
+  </section>
+
+  <!-- ============== HABITS GRID ============== -->
+  <main class="habits-section">
+    <div class="section-head">
+      <h2>Thói quen của bạn</h2>
+      <div class="legend">
+        <span class="legend-item"><i class="dot dot-stage-1"></i>Khởi động</span>
+        <span class="legend-item"><i class="dot dot-stage-2"></i>Tích tụ</span>
+        <span class="legend-item"><i class="dot dot-stage-3"></i>Vô thức</span>
+      </div>
+    </div>
+
+    <div class="habits-grid" id="habitsGrid"></div>
+
+    <div class="empty-state" id="emptyState" hidden>
+      <div class="empty-illustration" aria-hidden="true">❄️</div>
+      <h3>Chưa có quả cầu tuyết nào</h3>
+      <p>Bắt đầu bằng cách thêm một thói quen bạn muốn biến thành phản xạ.</p>
+      <button class="btn btn-primary" id="emptyAddBtn">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        Tạo thói quen đầu tiên
+      </button>
+    </div>
+  </main>
+
+  <!-- ============== MODAL: ADD / EDIT HABIT ============== -->
+  <div class="modal-backdrop" id="modalBackdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header class="modal-head">
+        <h3 id="modalTitle">Thêm thói quen mới</h3>
+        <button class="icon-btn" id="closeModalBtn" data-close="1" aria-label="Đóng">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </header>
+      <form class="modal-body" id="habitForm">
+        <input type="hidden" id="habitId" />
+        <label class="field">
+          <span>Tên thói quen</span>
+          <input
+            id="habitName"
+            type="text"
+            maxlength="60"
+            placeholder="Ví dụ: Tập Gym, Đọc sách 20 phút, Thiền 10 phút..."
+            required
+          />
+        </label>
+
+        <label class="field">
+          <span>Biểu tượng (tùy chọn)</span>
+          <input
+            id="habitEmoji"
+            type="text"
+            maxlength="2"
+            placeholder="Ví dụ: 🏋️ 📚 🧘"
+          />
+        </label>
+
+        <label class="field">
+          <span>Điểm khởi đầu (0–100)</span>
+          <input id="habitScore" type="number" min="0" max="100" step="1" value="0" />
+        </label>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost" id="cancelModalBtn" data-close="1">Huỷ</button>
+          <button type="submit" class="btn btn-primary">Lưu thói quen</button>
+        </div>
+        <button type="button" class="modal-big-close" id="modalBigCloseBtn" data-close="1">
+          Đóng cửa sổ
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============== TOAST ============== -->
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js?v=7"></script>
+</body>
+</html>
