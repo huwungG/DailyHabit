@@ -1,0 +1,57 @@
+# Cursor Rules — Habit Snowball
+
+## Project overview
+- **Name**: Habit Snowball & Time-Tracker (Vietnamese habit tracker).
+- **Type**: Single-page web app, plain HTML/CSS/vanilla JS (no framework, no build step).
+- **Backend**: Google Apps Script Web App (`Code.gs`) using Google Sheets as a tiny key/value store.
+- **Language**: All UI copy is in **Vietnamese (tiếng Việt)**. Keep it that way unless explicitly asked otherwise.
+- **Storage**: `localStorage` is the source of truth on-device; Sheet is a cloud backup that gets merged with local state.
+
+## File map
+- `d:\Sec\index.html` — markup, modal markup (add habit, sync), header, stats grid.
+- `d:\Sec\app.js` — all client logic (IIFE). Module order: storage → utils → state mutations → render → event wiring → sync module (at the bottom).
+- `d:\Sec\styles.css` — styling. Versioned via `?v=N` query string in `<link>` — bump it when making meaningful visual changes.
+- `d:\Sec\Code.gs` — Apps Script backend. Paste into script.google.com, deploy as Web App.
+- `d:\Sec\SYNC_SETUP.md` — user-facing setup guide (Vietnamese). Keep in sync if sync flow changes.
+
+## State shape
+- localStorage key: `habit_snowball_v1`.
+- Sync config key: `habit_snowball_sync_v1`.
+- Sync meta key: `habit_snowball_sync_meta_v1`.
+- Top-level: `{ habits: Habit[] }`.
+- `Habit` fields (see `normalizeHabit` in `app.js`): `id`, `name`, `emoji`, `type` (`'good'|'bad'`), `score` (0–100), `streak`, `lastCompleted`, `lastDecayAppliedDate`, `history[]` where each entry is `{ timestamp, hourOfDay, dateKey }`.
+- Default state: `{ habits: [] }` — never invent other top-level keys.
+
+## Sync protocol (Google Apps Script ↔ Sheets)
+- Single Web App URL handles both `GET` (read) and `POST` (write).
+- Auth: shared passcode sent via `?p=...` query param, stored server-side in Script Properties under key `SYNC_PASSCODE`.
+- Sheet name constant: `habit_snowball`. Schema: 1 row, 3 cells `[key='state', stateJSON, updatedAt]`.
+- Last-write-wins with `baseUpdatedAt` check; on conflict server returns `{ ok:false, conflict:true, serverUpdatedAt, serverState }` and the client must reconcile.
+- Client merge rule: for the same `id`, the entry whose most-recent `history[].timestamp` is newer wins; unique IDs are unioned.
+- Auto-sync debounce: ~5 seconds after any state change (see sync module at the bottom of `app.js`).
+- Manual buttons in the sync modal: **💾 Lưu cấu hình** (save + auto-sync), **⬆ Đẩy lên cloud** (force push), **⬇ Tải về từ cloud** (force overwrite local — destructive).
+
+## Coding conventions
+- Vanilla JS only. No bundler, no TypeScript, no npm dependencies. Don't add them unless asked.
+- `app.js` is wrapped in `(() => { 'use strict'; ... })();` — keep new code inside that IIFE.
+- Prefer `const`, arrow functions, `structuredClone` for deep copies (already used in `loadState`).
+- IDs generated via `makeId()` (`'h_' + base36 random + base36 timestamp`) — never use `Date.now()` alone.
+- Dates normalized through `dayKey(d)` returning `YYYY-M-D` (note: no zero-padding, must match exactly).
+- Toast notifications via `showToast(message, isError)`.
+- Don't break the `normalizeHabit` contract — any new habit field must be added there with a safe default.
+- CSS: keep class naming BEM-ish (`.habit-card`, `.stat-card`, `.btn-primary`, `.btn-ghost`). Don't introduce CSS-in-JS or utility frameworks.
+- Bump `styles.css?v=N` in `index.html` when shipping visual changes so cached users see updates.
+
+## Things to avoid
+- Don't add login/auth UI — passcode is shared-secret only.
+- Don't store habits anywhere other than the two keys above unless asked (no IndexedDB, no cookies).
+- Don't change the Sheet's 1-row/3-cell layout without also updating `Code.gs` and `SYNC_SETUP.md`.
+- Don't translate existing Vietnamese copy to English "to be helpful" — the user wrote it that way on purpose.
+- Don't add new global scripts or `defer` patterns without checking the IIFE scope in `app.js`.
+- Don't commit the Web App URL or passcode to this repo — they live in each user's localStorage.
+
+## When editing
+1. Read the relevant section of `app.js` first — the file is one big IIFE, so order matters.
+2. If you touch state shape, update `normalizeHabit`, `DEFAULT_STATE`, and (if sync-relevant) `Code.gs`.
+3. If you change the sync flow, update `SYNC_SETUP.md` in the same change.
+4. Keep changes minimal and localized — this is a personal-tracker app, not a framework.

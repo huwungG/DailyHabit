@@ -24,6 +24,14 @@
       }
       // Ensure all habits have required fields
       parsed.habits = parsed.habits.map(normalizeHabit);
+      // Garbage collection: xóa vĩnh viễn habit bị soft-delete > 30 ngày
+      const now = Date.now();
+      const cutoff = 30 * 86400000; // 30 ngày
+      parsed.habits = parsed.habits.filter(h => {
+        if (h._deleted !== true) return true;
+        const deletedAt = Number(h._deletedAt) || 0;
+        return (now - deletedAt) < cutoff;
+      });
       return parsed;
     } catch (err) {
       console.warn('Failed to load state, using default', err);
@@ -73,6 +81,9 @@
             })
             .filter((entry) => entry.hourOfDay >= 0 && entry.hourOfDay <= 23)
         : [],
+      // Soft delete: habit bị xoá nhưng giữ lại data (CRDT-safe, multi-device OK)
+      _deleted: h._deleted === true ? true : false,
+      _deletedAt: h._deletedAt || null,
     };
   }
 
@@ -154,6 +165,8 @@
   }
 
   function applyCheckIn(habit, now = new Date()) {
+    // Soft-deleted habits: không cho check-in nữa.
+    if (habit._deleted === true) return { changed: false, reason: 'Thói quen đã bị xoá.' };
     const previousStreak = habit.streak || 0;
     const todayKey = dayKey(now);
 
@@ -341,6 +354,8 @@
    * Note: we apply decay ONLY if the habit was NOT completed today.
    */
   function applyDailyDecay(habit, now = new Date()) {
+    // Soft-deleted habits are inert: no decay applied.
+    if (habit._deleted === true) return;
     const today = startOfDay(now);
     const todayKey = dayKey(today);
 
@@ -496,6 +511,7 @@
         h.score = clampScore(Number(score) || 0);
         h.type = type === 'bad' ? 'bad' : 'good';
         saveState();
+        maybeAutoSync();
         return h;
       }
     }
@@ -512,12 +528,20 @@
     });
     state.habits.unshift(fresh);
     saveState();
+    maybeAutoSync();
     return fresh;
   }
 
   function deleteHabit(id) {
-    state.habits = state.habits.filter((h) => h.id !== id);
+    const habit = state.habits.find((h) => h.id === id);
+    if (!habit) return;
+    // Soft delete: đánh dấu _deleted thay vì xóa khỏi array.
+    // Khi sync, device khác pull về sẽ thấy _deleted=true → tự ẩn.
+    habit._deleted = true;
+    habit._deletedAt = Date.now();
     saveState();
+    // Push ngay lên cloud (force=true) để device khác không thấy habit này nữa.
+    maybeAutoSync(true);
   }
 
   function checkInHabit(id) {
@@ -525,6 +549,7 @@
     if (!habit) return;
     const result = applyCheckIn(habit, new Date());
     saveState();
+    maybeAutoSync();
     if (!result.changed) {
       showToast(result.reason);
       return;
@@ -543,6 +568,7 @@
     if (!habit) return;
     const result = undoLastCheckIn(habit);
     saveState();
+    maybeAutoSync();
     if (!result.changed) {
       showToast(result.reason, true);
       return;
@@ -574,6 +600,12 @@
   const habitEmojiInput = document.getElementById('habitEmoji');
   const habitScoreInput = document.getElementById('habitScore');
 
+  // Helper: lọc bỏ các habit đã soft-delete. Dùng cho predictive bar,
+  // stats, grid — mọi nơi cần hiển thị/đếm habit "đang sống".
+  function activeHabits() {
+    return state.habits.filter((h) => h && h._deleted !== true);
+  }
+
   function render() {
     // Apply daily decay to all habits first
     state.habits.forEach((h) => applyDailyDecay(h, new Date()));
@@ -589,14 +621,16 @@
     elPredictiveTimeText.textContent = formatTime(now);
     elPredictiveSlot.textContent = slotOfHour(now.getHours());
 
-    if (state.habits.length === 0) {
+    const active = activeHabits();
+
+    if (active.length === 0) {
       elPredictiveMsg.innerHTML =
         'Thêm vài thói quen và bắt đầu check-in để nhận gợi ý thông minh.';
       return;
     }
 
     // Score each habit by current-hour probability
-    const scored = state.habits
+    const scored = active
       .map((h) => ({
         habit: h,
         prob: probabilityForCurrentHour(h, now),
@@ -631,7 +665,7 @@
   }
 
   function renderStats() {
-    const habits = state.habits;
+    const habits = activeHabits();
     elStatTotal.textContent = habits.length;
 
     const autopilot = habits.filter((h) => getStage(h.score) === 3).length;
@@ -768,7 +802,10 @@
   function renderGrid() {
     const now = new Date();
 
-    if (state.habits.length === 0) {
+    // Chỉ hiển thị habit chưa bị xoá (_deleted !== true)
+    const visible = state.habits.filter(h => h._deleted !== true);
+
+    if (visible.length === 0) {
       elGrid.innerHTML = '';
       elEmpty.hidden = false;
       return;
@@ -777,7 +814,7 @@
 
     // Sort habits: highest current-hour probability first (smart suggestion),
     // then by score, then by streak.
-    const sorted = state.habits
+    const sorted = visible
       .map((h) => ({
         habit: h,
         prob: probabilityForCurrentHour(h, now),
@@ -1272,20 +1309,75 @@
     if (remote && !local) return remote;
 
     const lHist = Array.isArray(local.history)  ? local.history  : [];
-    const rHist = Array.isArray(remote.history) ? remote.history : [];
+    const rHist = Array.isArray(remote.history) ? remote.history  : [];
 
     const lLatest = lHist.length ? lHist[lHist.length - 1].timestamp : 0;
     const rLatest = rHist.length ? rHist[rHist.length - 1].timestamp : 0;
 
+    // --- Step 1: hợp nhất history[] (union các tick, dedupe theo timestamp) ---
+    const histByTs = new Map();
+    const put = (e) => {
+      if (!e || typeof e.timestamp !== 'number') return;
+      // Dùng timestamp làm khóa chính; nếu trùng ts (cùng 1 tick từ 2 thiết bị),
+      // giữ bản có dateKey/hourOfDay "đầy đủ" hơn.
+      const ts = e.timestamp;
+      const cur = histByTs.get(ts);
+      if (!cur) {
+        histByTs.set(ts, e);
+      } else {
+        const curScore = (typeof cur.hourOfDay === 'number' ? 1 : 0)
+                       + (typeof cur.dateKey  === 'string' && cur.dateKey ? 1 : 0);
+        const newScore = (typeof e.hourOfDay === 'number' ? 1 : 0)
+                       + (typeof e.dateKey  === 'string' && e.dateKey  ? 1 : 0);
+        if (newScore > curScore) histByTs.set(ts, e);
+      }
+    };
+    lHist.forEach(put);
+    rHist.forEach(put);
+    const mergedHist = Array.from(histByTs.values()).sort((a, b) => a.timestamp - b.timestamp);
+
+    // --- Step 2: hợp nhất streak (lấy max) ---
+    const mergedStreak = Math.max(Number(local.streak) || 0, Number(remote.streak) || 0);
+
+    // --- Step 3: hợp nhất lastCompleted / lastDecayAppliedDate (lấy bản mới nhất) ---
+    const lLc  = local.lastCompleted         ? new Date(local.lastCompleted).getTime()         : 0;
+    const rLc  = remote.lastCompleted        ? new Date(remote.lastCompleted).getTime()        : 0;
+    const lDec = local.lastDecayAppliedDate  ? new Date(local.lastDecayAppliedDate).getTime()  : 0;
+    const rDec = remote.lastDecayAppliedDate ? new Date(remote.lastDecayAppliedDate).getTime() : 0;
+
+    const mergedLc  = lLc >= rLc  ? local.lastCompleted         : remote.lastCompleted;
+    const mergedDec = lDec >= rDec ? local.lastDecayAppliedDate  : remote.lastDecayAppliedDate;
+
+    // --- Step 4: hợp nhất score (ưu tiên bản có tick mới nhất; tie → max) ---
+    let winner;
     if (lLatest !== rLatest) {
-      return lLatest > rLatest ? local : remote;
+      winner = lLatest > rLatest ? local : remote;
+    } else if ((local.score || 0) !== (remote.score || 0)) {
+      winner = (local.score || 0) > (remote.score || 0) ? local : remote;
+    } else {
+      winner = local; // tiebreaker
     }
 
-    // Tiebreaker: prefer higher score, then local.
-    if ((local.score || 0) !== (remote.score || 0)) {
-      return (local.score || 0) > (remote.score || 0) ? local : remote;
-    }
-    return local;
+    // --- Step 5: Soft delete — nếu 1 trong 2 bên _deleted=true thì giữ deleted ---
+    const isDeleted = local._deleted === true || remote._deleted === true;
+    const deletedAt = Math.max(
+      local._deletedAt ? Number(local._deletedAt) : 0,
+      remote._deletedAt ? Number(remote._deletedAt) : 0
+    ) || null;
+
+    return {
+      ...winner,
+      history: mergedHist,
+      streak: mergedStreak,
+      lastCompleted: mergedLc,
+      lastDecayAppliedDate: mergedDec,
+      // Ép đồng bộ các field meta khác nếu winner "lỗi thời" hơn.
+      emoji: winner.emoji || remote.emoji || local.emoji,
+      type:  winner.type  || remote.type  || local.type,
+      name:  winner.name  || remote.name  || local.name,
+      _deleted: isDeleted,
+      _deletedAt: deletedAt,
+    };
   }
 
   /** Read from cloud. Returns { ok, state, updatedAt } or { ok:false, error }. */
@@ -1356,7 +1448,38 @@
       lastError: '',
     });
     render();
-    return { ok: true, merged: true };
+    return { ok: true, merged, serverUpdatedAt };
+  }
+
+  /**
+   * So sánh state local với state trên cloud.
+   * Trả về { gapDays, localCount, remoteCount, overlapIds, onlyLocal, onlyRemote }.
+   * Dùng để quyết định có nên cảnh báo trước khi pull (ghi đè local).
+   */
+  function diffStates(local, remote) {
+    const lh = (local && local.habits) || [];
+    const rh = (remote && remote.habits) || [];
+    const lIds = new Set(lh.map(h => h.id));
+    const rIds = new Set(rh.map(h => h.id));
+    const overlap = [];
+    lIds.forEach(id => { if (rIds.has(id)) overlap.push(id); });
+    const onlyLocal  = [...lIds].filter(id => !rIds.has(id));
+    const onlyRemote = [...rIds].filter(id => !lIds.has(id));
+
+    // Khoảng cách ngày: lấy max(lastCompleted) của mỗi bên trừ nhau.
+    const lastTs = (arr) => arr.reduce((m, h) => Math.max(m, Number(h.lastCompleted) ? new Date(h.lastCompleted).getTime() : 0), 0);
+    const lLast = lastTs(lh);
+    const rLast = lastTs(rh);
+    const gapDays = lLast && rLast ? Math.abs(lLast - rLast) / 86400000 : 0;
+
+    return {
+      gapDays,
+      localCount: lh.length,
+      remoteCount: rh.length,
+      overlapIds: overlap.length,
+      onlyLocal,
+      onlyRemote,
+    };
   }
 
   /** Just push local state up (overwrites cloud). */
@@ -1524,12 +1647,22 @@
       if (!res.ok) {
         handleSyncError('Đẩy lên thất bại', res);
         if (res.conflict && res.serverState) {
-          const ok = confirm('Server có phiên bản mới hơn. Bạn có muốn gộp (merge) với server không? Bấm Cancel để giữ nguyên bản local và không ghi đè.');
-          if (ok) {
-            const m = await performPullMergePush(cfg2);
-            if (!m.ok) handleSyncError('Merge thất bại', m);
+          // Không hỏi confirm nữa — luôn tự merge để tránh mất dữ liệu.
+          const beforeHabits  = loadState().habits.length;
+          const beforeRemote  = (res.serverState && res.serverState.habits || []).length;
+          const m = await performPullMergePush(cfg2);
+          if (!m.ok) {
+            handleSyncError('Merge thất bại', m);
+          } else {
+            const after = loadState().habits.length;
+            showToast(
+              `Đã gộp dữ liệu: local ${beforeHabits} → ${after}, cloud ${beforeRemote} → ${m.merged?.habits?.length ?? '?'}.`,
+              false
+            );
           }
         }
+      } else {
+        showToast('Đã đẩy lên cloud.');
       }
     } finally {
       setSyncBusy(false);
@@ -1544,13 +1677,49 @@
       return;
     }
     saveSyncConfig({ ...cfg, url: syncUrlInput.value.trim(), passcode: syncPassInput.value.trim() });
-    const ok = confirm('Tải về từ cloud sẽ THAY THẾ toàn bộ dữ liệu trên thiết bị này. Nếu muốn an toàn, hãy dùng nút "Lưu cấu hình" rồi đợi app tự đồng bộ. Tiếp tục?');
-    if (!ok) return;
     setSyncBusy(true);
     try {
       const cfg2 = loadSyncConfig();
+      // Lấy trước dữ liệu cloud để cảnh báo nếu lệch lớc.
+      const fetch = await fetchFromCloud(cfg2);
+      if (!fetch.ok) {
+        handleSyncError('Không tải được cloud để kiểm tra', fetch);
+        return;
+      }
+      const serverState = fetch.state || { habits: [] };
+      const diff = diffStates(state, serverState);
+
+      // Cảnh báo khi pull (ghi đè local) có rủi ro mất dữ liệu.
+      const warnings = [];
+      if (diff.onlyLocal.length > 0) {
+        warnings.push(`${diff.onlyLocal.length} thói quen chỉ có ở máy này sẽ bị MẤT`);
+      }
+      if (diff.gapDays >= 7) {
+        warnings.push(`chênh lệch ~${diff.gapDays.toFixed(1)} ngày`);
+      }
+      if (diff.localCount === 0 && diff.remoteCount > 0) {
+        warnings.push('máy này chưa có dữ liệu — bạn sẽ nhận toàn bộ từ cloud');
+      }
+      if (warnings.length > 0) {
+        const msg =
+          '⚠️ Tải về từ cloud sẽ GHI ĐÈ máy này.\n\n' +
+          warnings.map(w => '• ' + w).join('\n') +
+          '\n\nBạn có muốn:\n' +
+          '  OK = vẫn tải về (ghi đè).\n' +
+          '  Cancel = dừng và dùng "Đẩy lên cloud" thay vào đó (an toàn hơn).';
+        const ok = confirm(msg);
+        if (!ok) {
+          showToast('Đã huỷ. Gợi ý: dùng "Đẩy lên cloud" để gộp an toàn.');
+          return;
+        }
+      } else {
+        const ok = confirm('Tải về từ cloud. Dữ liệu trên máy này sẽ bị thay thế. Tiếp tục?');
+        if (!ok) return;
+      }
+
       const res = await performPullOnly(cfg2);
       if (!res.ok) handleSyncError('Tải về thất bại', res);
+      else showToast(`Đã tải về ${diff.remoteCount} thói quen từ cloud.`);
     } finally {
       setSyncBusy(false);
       updateSyncLastInfo();
