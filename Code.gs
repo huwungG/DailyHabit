@@ -10,6 +10,7 @@
 
 const SHEET_NAME    = 'habit_snowball';
 const PROP_PASSC    = 'SYNC_PASSCODE';   // key trong Script Properties
+const PROP_SHEET    = 'SYNC_SHEET_ID';   // ID của Google Sheet dùng làm DB
 
 /* =========================================================
  *  Web App entrypoints
@@ -76,13 +77,13 @@ function handle_(e, isWrite) {
     // Nếu client gửi kèm baseUpdatedAt thì check "last-write-wins" an toàn:
     // server chỉ ghi đè khi incoming mới hơn (hoặc server rỗng).
     if (body.baseUpdatedAt && serverTs && Number(body.baseUpdatedAt) < serverTs) {
-      // Trả về server state để client biết có xung đột
+      // Trả về server state để client merge đúng.
       return json_({
         ok: false,
         conflict: true,
         serverUpdatedAt: serverTs,
         serverState: safeParse_(row[1]),
-        message: 'Phiên bản trên server mới hơn. Client sẽ hỏi người dùng.'
+        message: 'Phiên bản trên server mới hơn. Client sẽ merge.'
       });
     }
 
@@ -102,11 +103,40 @@ function handle_(e, isWrite) {
  *  Helpers
  * ========================================================= */
 
+/**
+ * Lấy Google Sheet để làm DB.
+ * Ưu tiên 1: Spreadsheet đã được gắn với project (mở bằng cách
+ *   "Resources" → "Add a shortcut" hoặc "Extensions" → "Apps Script").
+ * Ưu tiên 2: Nếu không có, dùng SHEET_ID trong Script Properties.
+ * Ưu tiên 3: Nếu vẫn không có, TỰ TẠO Sheet mới trong Drive của bạn
+ *   và lưu SHEET_ID lại cho lần sau.
+ */
 function ensureSheet_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let ss = SpreadsheetApp.getActiveSpreadsheet();
+
   if (!ss) {
-    throw new Error('Chưa gắn Google Sheet vào Apps Script. Vào "Services" → bật Sheets và "Resources" → "Add a shortcut".');
+    const id = PropertiesService.getScriptProperties().getProperty(PROP_SHEET);
+    if (id) {
+      try {
+        ss = SpreadsheetApp.openById(id);
+      } catch (err) {
+        throw new Error(
+          'Không mở được Sheet với ID đã lưu (' + id + '). ' +
+          'Chạy hàm bindSheet() với URL mới, hoặc unbindSheet() để tạo Sheet mới.'
+        );
+      }
+    } else {
+      // Tự tạo một Google Sheet mới trong Drive của owner script.
+      ss = SpreadsheetApp.create('Habit Snowball DB');
+      PropertiesService.getScriptProperties().setProperty(PROP_SHEET, ss.getId());
+      // Mặc định Sheet mới có 1 tab tên "Sheet1" — đổi tên cho khớp SHEET_NAME.
+      const firstTab = ss.getSheets()[0];
+      if (firstTab && firstTab.getName() !== SHEET_NAME) {
+        firstTab.setName(SHEET_NAME);
+      }
+    }
   }
+
   let sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(SHEET_NAME);
@@ -150,4 +180,30 @@ function resetData() {
   const sheet = ensureSheet_();
   sheet.getRange(1, 1, 1, 3).setValues([['state', '', 0]]);
   Logger.log('Đã reset.');
+}
+
+/**
+ * Gắn Apps Script với một Google Sheet có sẵn.
+ * Chạy 1 lần nếu bạn muốn dùng Sheet đã tạo sẵn:
+ *   bindSheet('https://docs.google.com/spreadsheets/d/1AbCd.../edit')
+ */
+function bindSheet(urlOrId) {
+  if (!urlOrId) throw new Error('Truyền URL hoặc ID của Google Sheet.');
+  const m = String(urlOrId).match(/\/d\/([a-zA-Z0-9-_]+)/);
+  const id = m ? m[1] : String(urlOrId).trim();
+  SpreadsheetApp.openById(id); // throws nếu không truy cập được
+  PropertiesService.getScriptProperties().setProperty(PROP_SHEET, id);
+  Logger.log('Đã gắn Sheet ID: ' + id);
+}
+
+/** Xoá gắn kết — lần sau sẽ tự tạo Sheet mới trong Drive. */
+function unbindSheet() {
+  PropertiesService.getScriptProperties().deleteProperty(PROP_SHEET);
+  Logger.log('Đã gỡ Sheet ID.');
+}
+
+/** In Sheet ID hiện tại (nếu có). */
+function printSheetId() {
+  const id = PropertiesService.getScriptProperties().getProperty(PROP_SHEET);
+  Logger.log('Sheet ID: ' + (id || '(chưa gắn — sẽ tự tạo khi có request đầu tiên)'));
 }
